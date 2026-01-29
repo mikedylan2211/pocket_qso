@@ -1,0 +1,84 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Pocket QSO</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>Pocket QSO</h1>
+    <div class="sub">QSO log synced in this chat</div>
+  </header>
+
+  <section class="card">
+    <h2>Import / Export</h2>
+    <div class="sub">Times are stored in local time; ADIF export uses UTC.</div>
+
+    <div class="row">
+        <button id="exportCsvBtn" type="button">Export CSV</button>
+        <button id="exportAdifBtn" type="button">Export ADIF</button>
+    </div>
+
+    <div class="row">
+        <label>
+        Import file (CSV or ADIF)
+        <input id="importFile" type="file" accept=".csv,.adi,.adif,text/csv,text/plain" />
+        </label>
+    </div>
+
+    <details class="details">
+      <summary>Paste CSV/ADIF</summary>
+      <textarea id="importText" rows="5" placeholder="Paste CSV or ADIF here"></textarea>
+      <button id="importTextBtn" type="button" class="ghost">Import Pasted</button>
+    </details>
+
+    <div class="sub" id="importStatus"></div>
+  </section>
+
+
+  <section class="card">
+    <h2>Add QSO</h2>
+    <form id="qsoForm">
+      <div class="row">
+        <label>Callsign <input id="callsign" required placeholder="HB9XYZ" /></label>
+        <label>Date/Time (Local) <input id="dt" type="datetime-local" required /></label>
+      </div>
+      <div class="row">
+        <label>Band <input id="band" placeholder="20m" /></label>
+        <label>Frequency (MHz) <input id="freq" placeholder="14.074" /></label>
+        <label>Mode <input id="mode" placeholder="SSB/CW/FT8" /></label>
+      </div>
+      <div class="row">
+        <label>My Setup <input id="setup" placeholder="Icom-7500, Magloop MC-20" /></label>
+      </div>
+      <div class="row">
+        <label>My Grid <input id="myGrid" placeholder="FN20" /></label>
+        <label>Their Grid <input id="theirGrid" placeholder="EM13" /></label>
+      </div>
+      <div class="row">
+        <label>RST Sent <input id="rstS" placeholder="59" /></label>
+        <label>RST Rcvd <input id="rstR" placeholder="59" /></label>
+      </div>
+      <label>Notes <input id="notes" placeholder="QTH, rig, antenna..." /></label>
+
+      <div class="row">
+        <button type="submit" id="saveBtn">Save QSO</button>
+        <button type="button" id="cancelEdit" class="ghost hidden">Cancel</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="card">
+    <div class="row space">
+      <h2>Log</h2>
+      <input id="search" placeholder="Search callsign/mode/band/notes" />
+    </div>
+    <div id="list"></div>
+  </section>
+
+  <script src="webxdc.js"></script>
+  <script src="main.js"></script>
+</body>
+</html>

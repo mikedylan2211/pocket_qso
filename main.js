@@ -1,0 +1,759 @@
+let qsos = [];
+let seenSerials = new Set();
+const LOCAL_KEY = "hamlog.qsos.v1";
+let editingId = null;
+let pendingDeleteId = null;
+let pendingDeleteTimer = null;
+
+function isWebxdc() {
+  return typeof window.webxdc !== "undefined";
+}
+
+function canSendUpdate() {
+  return !!window.webxdc?.sendUpdate;
+}
+
+function sendUpdateCompat(payload, info) {
+  const update = { payload };
+  if (info) update.info = info;
+  // Spec: second argument is deprecated; pass empty string for compatibility.
+  if (window.webxdc?.sendUpdate) return window.webxdc.sendUpdate(update, "");
+}
+
+function escapeHtml(s) {
+  return (s ?? "").toString().replace(/[&<>"']/g, c => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;", "\"":"&quot;","'":"&#39;"
+  }[c]));
+}
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function parseLocalDT(dt) {
+  if (!dt) return null;
+  const m = dt.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+  if (!m) return null;
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]));
+}
+
+function parseFlexibleDT(dt) {
+  if (!dt) return null;
+  const s = dt.trim();
+  if (/[zZ]|[+-]\d{2}:?\d{2}$/.test(s)) {
+    const t = Date.parse(s);
+    if (!Number.isNaN(t)) return new Date(t);
+  }
+  return parseLocalDT(s.replace(" ", "T"));
+}
+
+function toLocalInputValue(date) {
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}T${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+}
+
+function tsFromLocalDT(dt) {
+  const d = parseLocalDT(dt);
+  return d ? d.getTime() : null;
+}
+
+function tsFromDT(dt) {
+  const d = parseFlexibleDT(dt);
+  return d ? d.getTime() : null;
+}
+
+function formatDisplayDT(dt) {
+  return dt ? dt.replace("T", " ") : "";
+}
+
+function formatMHzValue(mhz) {
+  const s = mhz.toFixed(6);
+  return s.replace(/\.?0+$/, "");
+}
+
+function parseFreqMHz(freq) {
+  if (!freq) return null;
+  const s = freq.toString().trim().toLowerCase();
+  if (!s) return null;
+  // Avoid interpreting band labels like "20m" as MHz.
+  if (/[a-z]/.test(s) && !s.includes("hz")) return null;
+
+  const num = parseFloat(s.replace(",", "."));
+  if (Number.isNaN(num)) return null;
+
+  if (s.includes("ghz")) return num * 1000;
+  if (s.includes("khz")) return num / 1000;
+  if (s.includes("hz") && !s.includes("khz") && !s.includes("mhz") && !s.includes("ghz")) return num / 1e6;
+  return num; // default MHz
+}
+
+function normalizeAdifFreq(freq) {
+  const mhz = parseFreqMHz(freq);
+  if (mhz == null) return "";
+  return formatMHzValue(mhz);
+}
+
+function formatFreqDisplay(freq) {
+  if (!freq) return "";
+  const mhz = parseFreqMHz(freq);
+  if (mhz == null) return freq.toString().trim();
+  return `${formatMHzValue(mhz)} MHz`;
+}
+
+function qsoKey(qso) {
+  if (!qso?.callsign || !qso?.dt) return "";
+  return `${qso.callsign}|${qso.dt}|${qso.band || ""}|${qso.freq || ""}|${qso.mode || ""}|${qso.myGrid || ""}|${qso.theirGrid || ""}`.toUpperCase();
+}
+
+function hasDuplicate(qso) {
+  const key = qsoKey(qso);
+  return qsos.some(x => x.id === qso.id || (key && qsoKey(x) === key));
+}
+
+function insertQso(qso) {
+  if (!qso) return false;
+  if (hasDuplicate(qso)) return false;
+  qsos.push(qso);
+  return true;
+}
+
+function upsertQso(qso) {
+  if (!qso) return false;
+  const idx = qsos.findIndex(x => x.id === qso.id);
+  if (idx >= 0) {
+    qsos[idx] = qso;
+    return true;
+  }
+  return insertQso(qso);
+}
+
+function removeQsoById(id) {
+  const before = qsos.length;
+  qsos = qsos.filter(x => x.id !== id);
+  return qsos.length !== before;
+}
+
+function sortQsos() {
+  qsos.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+}
+
+function saveLocalQsos() {
+  try {
+    localStorage.setItem(LOCAL_KEY, JSON.stringify(qsos));
+  } catch (_) {}
+}
+
+function loadLocalQsos() {
+  try {
+    const raw = localStorage.getItem(LOCAL_KEY);
+    if (!raw) return;
+    const data = JSON.parse(raw);
+    if (Array.isArray(data)) {
+      qsos = data.filter(Boolean);
+      sortQsos();
+    }
+  } catch (_) {}
+}
+
+function applyUpdate(update) {
+  const p = update?.payload;
+  if (!p?.type) return;
+  let changed = false;
+
+  if (p.type === "add_qso" && p.qso) {
+    // Avoid duplicates by id
+    if (insertQso(p.qso)) changed = true;
+  }
+
+  if (p.type === "edit_qso" && p.qso) {
+    if (upsertQso(p.qso)) changed = true;
+  }
+
+  if (p.type === "bulk_add" && Array.isArray(p.qsos)) {
+    for (const qso of p.qsos) {
+      if (insertQso(qso)) changed = true;
+    }
+  }
+
+  if (p.type === "delete_qso" && p.id) {
+    if (removeQsoById(p.id)) changed = true;
+  }
+
+  if (changed) {
+    sortQsos();
+  }
+}
+
+function render() {
+  const list = document.getElementById("list");
+  const q = (document.getElementById("search").value || "").toLowerCase();
+
+  const filtered = qsos.filter(x => {
+    const hay = `${x.callsign} ${x.band} ${x.freq} ${x.mode} ${x.myGrid} ${x.theirGrid} ${x.setup} ${x.notes}`.toLowerCase();
+    return hay.includes(q);
+  });
+
+  if (!filtered.length) {
+    list.innerHTML = `<div class="empty">No QSOs yet.</div>`;
+    return;
+  }
+
+  list.innerHTML = filtered.map(x => {
+    const bandVal = x.band ? escapeHtml(x.band) : "";
+    const freqVal = x.freq ? escapeHtml(formatFreqDisplay(x.freq)) : "";
+    const bandFreq = bandVal && freqVal ? `${bandVal} • ${freqVal}` : (bandVal || freqVal || "-");
+    const grids = [x.myGrid, x.theirGrid].filter(Boolean).map(escapeHtml).join(" • ");
+    const setup = x.setup ? `Setup: ${escapeHtml(x.setup)}` : "";
+    return `
+    <div class="item">
+      <b>${escapeHtml(x.callsign)}</b>
+      <div class="meta">
+        ${escapeHtml(formatDisplayDT(x.dt))} • ${bandFreq} • ${escapeHtml(x.mode || "-")}
+        • RST ${escapeHtml(x.rstS || "-")}/${escapeHtml(x.rstR || "-")}
+        ${grids ? ` • ${grids}` : ""}
+        ${setup ? ` • ${setup}` : ""}
+      </div>
+      ${x.notes ? `<div class="notes">${escapeHtml(x.notes)}</div>` : ""}
+      <div class="actions">
+        <button type="button" data-action="edit" data-id="${escapeHtml(x.id)}">Edit</button>
+        <button type="button" class="${x.id === pendingDeleteId ? "danger" : "ghost"}" data-action="delete" data-id="${escapeHtml(x.id)}">${x.id === pendingDeleteId ? "Confirm" : "Delete"}</button>
+      </div>
+    </div>
+  `;
+  }).join("");
+}
+
+function addQso(qso, descriptionOverride) {
+  if (!canSendUpdate()) {
+    if (insertQso(qso)) {
+      sortQsos();
+      saveLocalQsos();
+    }
+    render();
+    return;
+  }
+
+  sendUpdateCompat(
+    { type: "add_qso", qso },
+    descriptionOverride || `QSO ${qso.callsign} ${qso.band || ""} ${qso.mode || ""}`.trim()
+  );
+}
+
+function addQsosBatch(qsoList, descriptionOverride) {
+  if (!qsoList.length) return;
+  if (!canSendUpdate()) {
+    let changed = false;
+    for (const qso of qsoList) {
+      if (insertQso(qso)) changed = true;
+    }
+    if (changed) {
+      sortQsos();
+      saveLocalQsos();
+      render();
+    }
+    return;
+  }
+  const maxSize = window.webxdc?.sendUpdateMaxSize || 128000;
+  const chunks = [];
+  let current = [];
+  for (const qso of qsoList) {
+    current.push(qso);
+    const size = JSON.stringify({ payload: { type: "bulk_add", qsos: current } }).length;
+    if (size > maxSize && current.length > 1) {
+      current.pop();
+      chunks.push(current);
+      current = [qso];
+    }
+  }
+  if (current.length) chunks.push(current);
+
+  for (const chunk of chunks) {
+    sendUpdateCompat(
+      { type: "bulk_add", qsos: chunk },
+      descriptionOverride || `Imported ${chunk.length} QSO(s)`
+    );
+  }
+}
+
+function editQso(qso, descriptionOverride) {
+  if (!canSendUpdate()) {
+    if (upsertQso(qso)) {
+      sortQsos();
+      saveLocalQsos();
+      render();
+    }
+    return;
+  }
+  sendUpdateCompat(
+    { type: "edit_qso", qso },
+    descriptionOverride || `Edited QSO ${qso.callsign}`
+  );
+}
+
+function deleteQso(id, descriptionOverride) {
+  if (!id) return;
+  if (!canSendUpdate()) {
+    if (removeQsoById(id)) {
+      sortQsos();
+      saveLocalQsos();
+      render();
+    }
+    return;
+  }
+  sendUpdateCompat(
+    { type: "delete_qso", id },
+    descriptionOverride || "Deleted QSO"
+  );
+}
+
+function downloadText(filename, text, mime = "text/plain") {
+  const blob = new Blob([text], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function sendFileToChat(filename, text, mime, label) {
+  if (!window.webxdc?.sendToChat) return false;
+  window.webxdc.sendToChat({
+    text: label || `Exported ${filename}`,
+    file: { name: filename, plainText: text }
+  }).catch(() => {
+    // Fallback to download if sending fails
+    downloadText(filename, text, mime);
+  });
+  return true;
+}
+
+// ---------- CSV ----------
+function csvEscape(value) {
+  const s = (value ?? "").toString();
+  if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function exportCsv() {
+  const header = ["callsign","dt","band","freq","mode","setup","myGrid","theirGrid","rstS","rstR","notes","id","ts"];
+  const rows = qsos
+    .slice()
+    .sort((a,b) => (a.ts||0)-(b.ts||0)) // oldest first for export
+    .map(q => header.map(k => csvEscape(q[k])).join(","));
+  const out = [header.join(","), ...rows].join("\n");
+  if (!sendFileToChat("hamlog.csv", out, "text/csv", "Ham Log CSV export")) {
+    downloadText("hamlog.csv", out, "text/csv");
+  }
+  setStatus("Exported CSV.");
+}
+
+// Basic CSV parser (handles quoted fields)
+function parseCsv(text) {
+  const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").filter(l => l.trim().length);
+  if (!lines.length) return [];
+
+  const parseLine = (line) => {
+    const out = [];
+    let cur = "";
+    let inQuotes = false;
+    for (let i=0; i<line.length; i++) {
+      const ch = line[i];
+      if (inQuotes) {
+        if (ch === '"' && line[i+1] === '"') { cur += '"'; i++; }
+        else if (ch === '"') inQuotes = false;
+        else cur += ch;
+      } else {
+        if (ch === '"') inQuotes = true;
+        else if (ch === ",") { out.push(cur); cur = ""; }
+        else cur += ch;
+      }
+    }
+    out.push(cur);
+    return out;
+  };
+
+  const header = parseLine(lines[0]).map(h => h.trim());
+  const records = [];
+  for (let i=1; i<lines.length; i++) {
+    const cols = parseLine(lines[i]);
+    const obj = {};
+    for (let j=0; j<header.length; j++) obj[header[j]] = cols[j] ?? "";
+    records.push(obj);
+  }
+  return records;
+}
+
+function importCsv(text) {
+  const rows = parseCsv(text);
+  const qsoList = [];
+
+  for (const r of rows) {
+    const callsign = (r.callsign || "").trim().toUpperCase();
+    const dt = (r.dt || "").trim();
+    if (!callsign || !dt) continue;
+
+    const parsedTs = tsFromDT(dt);
+    const ts = Number(r.ts) || parsedTs || Date.now();
+    const qso = {
+      id: (r.id && r.id.trim()) ? r.id.trim() : (crypto.randomUUID?.() ?? `${ts}-${Math.random()}`),
+      callsign,
+      dt,
+      band: (r.band || "").trim(),
+      freq: (r.freq || "").trim(),
+      mode: (r.mode || "").trim().toUpperCase(),
+      setup: (r.setup || "").trim(),
+      myGrid: (r.myGrid || "").trim().toUpperCase(),
+      theirGrid: (r.theirGrid || "").trim().toUpperCase(),
+      rstS: (r.rstS || "").trim(),
+      rstR: (r.rstR || "").trim(),
+      notes: (r.notes || "").trim(),
+      ts
+    };
+    qsoList.push(qso);
+  }
+
+  addQsosBatch(qsoList, `Imported ${qsoList.length} QSO(s)`);
+  return qsoList.length;
+}
+
+// ---------- ADIF ----------
+function adifTag(name, value) {
+  const v = (value ?? "").toString();
+  if (!v) return "";
+  return `<${name}:${v.length}>${v} `;
+}
+
+function normalizeAdifBand(band) {
+  if (!band) return "";
+  let s = band.toString().trim().toUpperCase();
+  if (!s) return "";
+  s = s.replace(/\s+/g, "");
+
+  // Convert "20METERS"/"20METER" to "20M"
+  const meterMatch = s.match(/^(\d+(?:\.\d+)?)(METERS?|MTRS?)$/);
+  if (meterMatch) return `${meterMatch[1]}M`;
+
+  // If already has a known unit, normalize it
+  const unitMatch = s.match(/^(\d+(?:\.\d+)?)(MM|CM|M)$/);
+  if (unitMatch) return `${unitMatch[1]}${unitMatch[2]}`;
+
+  // If just a number, assume meters
+  if (/^\d+(?:\.\d+)?$/.test(s)) return `${s}M`;
+
+  return s;
+}
+
+// ADIF basics:
+// CALL, QSO_DATE (YYYYMMDD), TIME_ON (HHMM or HHMMSS), BAND, MODE, RST_SENT, RST_RCVD, COMMENT
+function exportAdif() {
+  const lines = [];
+  lines.push("Generated by Ham Log webxdc");
+  lines.push("<eoh>");
+  const sorted = qsos.slice().sort((a,b) => (a.ts||0)-(b.ts||0));
+
+  for (const q of sorted) {
+    // dt stored as local time "YYYY-MM-DDTHH:MM" — convert to UTC for ADIF export
+    let date = "";
+    let time = "";
+    const d = parseLocalDT(q.dt);
+    if (d) {
+      date = `${d.getUTCFullYear()}${pad2(d.getUTCMonth() + 1)}${pad2(d.getUTCDate())}`;
+      time = `${pad2(d.getUTCHours())}${pad2(d.getUTCMinutes())}`; // HHMM
+    }
+
+    const rec =
+      adifTag("CALL", q.callsign) +
+      adifTag("QSO_DATE", date) +
+      adifTag("TIME_ON", time) +
+      adifTag("BAND", normalizeAdifBand(q.band)) +
+      adifTag("FREQ", normalizeAdifFreq(q.freq)) +
+      adifTag("MODE", q.mode) +
+      adifTag("MY_RIG", q.setup) +
+      adifTag("MY_GRIDSQUARE", q.myGrid) +
+      adifTag("GRIDSQUARE", q.theirGrid) +
+      adifTag("RST_SENT", q.rstS) +
+      adifTag("RST_RCVD", q.rstR) +
+      adifTag("COMMENT", q.notes) +
+      "<eor>";
+    lines.push(rec);
+  }
+
+  if (!sendFileToChat("hamlog.adi", lines.join("\n"), "text/plain", "Ham Log ADIF export")) {
+    downloadText("hamlog.adi", lines.join("\n"), "text/plain");
+  }
+  setStatus("Exported ADIF.");
+}
+
+function parseAdif(text) {
+  // Very lightweight ADIF parser:
+  // - Find <eoh>, then split records by <eor>
+  // - Parse tags like <CALL:5>HB9XX
+  const lower = text.toLowerCase();
+  const eohIdx = lower.indexOf("<eoh>");
+  const body = eohIdx >= 0 ? text.slice(eohIdx + 5) : text;
+
+  const recs = body.split(/<eor>/i).map(r => r.trim()).filter(Boolean);
+  const out = [];
+
+  for (const rec of recs) {
+    const obj = {};
+    let i = 0;
+    while (i < rec.length) {
+      const lt = rec.indexOf("<", i);
+      if (lt < 0) break;
+      const gt = rec.indexOf(">", lt);
+      if (gt < 0) break;
+
+      const header = rec.slice(lt + 1, gt); // e.g. "CALL:5" or "MODE:3"
+      const m = header.match(/^([^:]+):(\d+)/);
+      if (!m) { i = gt + 1; continue; }
+
+      const tag = m[1].trim().toUpperCase();
+      const len = parseInt(m[2], 10);
+      const valueStart = gt + 1;
+      const value = rec.slice(valueStart, valueStart + len);
+
+      obj[tag] = value;
+      i = valueStart + len;
+    }
+    out.push(obj);
+  }
+  return out;
+}
+
+function importAdif(text) {
+  const records = parseAdif(text);
+  const qsoList = [];
+
+  for (const r of records) {
+    const callsign = (r.CALL || "").trim().toUpperCase();
+    if (!callsign) continue;
+
+    // Convert ADIF QSO_DATE + TIME_ON to our dt: "YYYY-MM-DDTHH:MM"
+    let dt = "";
+    if (r.QSO_DATE && /^\d{8}$/.test(r.QSO_DATE)) {
+      const yyyy = r.QSO_DATE.slice(0,4);
+      const mm = r.QSO_DATE.slice(4,6);
+      const dd = r.QSO_DATE.slice(6,8);
+
+      let hh = "00", mi = "00", ss = "00";
+      if (r.TIME_ON && /^\d{4,6}$/.test(r.TIME_ON)) {
+        hh = r.TIME_ON.slice(0,2);
+        mi = r.TIME_ON.slice(2,4);
+        if (r.TIME_ON.length >= 6) ss = r.TIME_ON.slice(4,6);
+      }
+      const utcDate = new Date(Date.UTC(Number(yyyy), Number(mm) - 1, Number(dd), Number(hh), Number(mi), Number(ss)));
+      dt = toLocalInputValue(utcDate);
+    } else {
+      // If no date, skip (keeps your log clean)
+      continue;
+    }
+
+    const ts = tsFromLocalDT(dt) || Date.now();
+    const qso = {
+      id: crypto.randomUUID?.() ?? `${ts}-${Math.random()}`,
+      callsign,
+      dt,
+      band: (r.BAND || "").trim(),
+      freq: (r.FREQ || "").trim(),
+      mode: (r.MODE || "").trim().toUpperCase(),
+      setup: (r.MY_RIG || r.RIG || "").trim(),
+      myGrid: (r.MY_GRIDSQUARE || r.MY_GRIDSQUARES || "").trim().toUpperCase(),
+      theirGrid: (r.GRIDSQUARE || r.GRIDS || "").trim().toUpperCase(),
+      rstS: (r.RST_SENT || "").trim(),
+      rstR: (r.RST_RCVD || "").trim(),
+      notes: (r.COMMENT || r.NOTES || "").trim(),
+      ts
+    };
+
+    qsoList.push(qso);
+  }
+
+  addQsosBatch(qsoList, `Imported ${qsoList.length} QSO(s)`);
+  return qsoList.length;
+}
+
+// ---------- UI wiring ----------
+function setStatus(msg) {
+  const el = document.getElementById("importStatus");
+  if (el) el.textContent = msg || "";
+}
+
+function init() {
+  // Default datetime = now (local time)
+  const dt = document.getElementById("dt");
+  dt.value = toLocalInputValue(new Date());
+
+  document.getElementById("qsoForm").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const callsign = document.getElementById("callsign").value.trim().toUpperCase();
+    const dtLocal = document.getElementById("dt").value;
+    if (!callsign || !dtLocal) return;
+
+    const band = document.getElementById("band").value.trim();
+    const freq = document.getElementById("freq").value.trim();
+    const mode = document.getElementById("mode").value.trim().toUpperCase();
+    const setup = document.getElementById("setup").value.trim();
+    const myGrid = document.getElementById("myGrid").value.trim().toUpperCase();
+    const theirGrid = document.getElementById("theirGrid").value.trim().toUpperCase();
+    const rstS = document.getElementById("rstS").value.trim();
+    const rstR = document.getElementById("rstR").value.trim();
+    const notes = document.getElementById("notes").value.trim();
+
+    const ts = tsFromLocalDT(dtLocal) || Date.now();
+    const qso = {
+      id: editingId || (crypto.randomUUID?.() ?? `${ts}-${Math.random()}`),
+      callsign,
+      dt: dtLocal,
+      band,
+      freq,
+      mode,
+      setup,
+      myGrid,
+      theirGrid,
+      rstS,
+      rstR,
+      notes,
+      ts
+    };
+    if (editingId) editQso(qso);
+    else addQso(qso);
+    // Keep commonly reused fields after submission.
+    const keep = { band, freq, mode, setup, myGrid };
+    setEditing(null);
+    document.getElementById("band").value = keep.band;
+    document.getElementById("freq").value = keep.freq;
+    document.getElementById("mode").value = keep.mode;
+    document.getElementById("setup").value = keep.setup;
+    document.getElementById("myGrid").value = keep.myGrid;
+  });
+
+  document.getElementById("search").addEventListener("input", render);
+
+  document.getElementById("exportCsvBtn").addEventListener("click", exportCsv);
+  document.getElementById("exportAdifBtn").addEventListener("click", exportAdif);
+
+  document.getElementById("importFile").addEventListener("change", async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setStatus(`Importing ${file.name}…`);
+    const text = await file.text();
+    const name = file.name.toLowerCase();
+
+    try {
+      let n = 0;
+      if (name.endsWith(".csv")) n = importCsv(text);
+      else if (name.endsWith(".adi") || name.endsWith(".adif")) n = importAdif(text);
+      else {
+        // guess by content
+        if (text.toLowerCase().includes("<eoh>") || text.toLowerCase().includes("<eor>")) n = importAdif(text);
+        else n = importCsv(text);
+      }
+      setStatus(`Imported ${n} QSO(s).`);
+    } catch (err) {
+      console.error(err);
+      setStatus(`Import failed: ${err?.message || err}`);
+    } finally {
+      // reset so importing same file again triggers change
+      e.target.value = "";
+    }
+  });
+
+  document.getElementById("importTextBtn").addEventListener("click", () => {
+    const el = document.getElementById("importText");
+    const text = el.value.trim();
+    if (!text) return;
+    try {
+      let n = 0;
+      if (text.toLowerCase().includes("<eoh>") || text.toLowerCase().includes("<eor>")) n = importAdif(text);
+      else n = importCsv(text);
+      setStatus(`Imported ${n} QSO(s) from pasted text.`);
+      el.value = "";
+    } catch (err) {
+      console.error(err);
+      setStatus(`Import failed: ${err?.message || err}`);
+    }
+  });
+
+  document.getElementById("cancelEdit").addEventListener("click", () => {
+    setEditing(null);
+  });
+
+  document.getElementById("list").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-action]");
+    if (!btn) return;
+    const action = btn.getAttribute("data-action");
+    const id = btn.getAttribute("data-id");
+    if (!id) return;
+
+    if (action === "delete") {
+      if (pendingDeleteId === id) {
+        pendingDeleteId = null;
+        if (pendingDeleteTimer) clearTimeout(pendingDeleteTimer);
+        deleteQso(id);
+      } else {
+        pendingDeleteId = id;
+        if (pendingDeleteTimer) clearTimeout(pendingDeleteTimer);
+        pendingDeleteTimer = setTimeout(() => {
+          pendingDeleteId = null;
+          render();
+        }, 4000);
+        render();
+      }
+      return;
+    }
+    if (action === "edit") {
+      const qso = qsos.find(x => x.id === id);
+      if (!qso) return;
+      setEditing(qso);
+    }
+  });
+
+  if (window.webxdc?.setUpdateListener) {
+    window.webxdc.setUpdateListener((update) => {
+      if (update.serial && seenSerials.has(update.serial)) return;
+      if (update.serial) seenSerials.add(update.serial);
+      applyUpdate(update);
+      render();
+    }, 0);
+  } else {
+    loadLocalQsos();
+  }
+
+  render();
+}
+
+init();
+
+function setEditing(qso) {
+  const form = document.getElementById("qsoForm");
+  const saveBtn = document.getElementById("saveBtn");
+  const cancelBtn = document.getElementById("cancelEdit");
+  if (!qso) {
+    editingId = null;
+    pendingDeleteId = null;
+    if (pendingDeleteTimer) clearTimeout(pendingDeleteTimer);
+    form.reset();
+    document.getElementById("dt").value = toLocalInputValue(new Date());
+    saveBtn.textContent = "Save QSO";
+    cancelBtn.classList.add("hidden");
+    return;
+  }
+  editingId = qso.id;
+  document.getElementById("callsign").value = qso.callsign || "";
+  document.getElementById("dt").value = qso.dt || toLocalInputValue(new Date());
+  document.getElementById("band").value = qso.band || "";
+  document.getElementById("freq").value = qso.freq || "";
+  document.getElementById("mode").value = qso.mode || "";
+  document.getElementById("setup").value = qso.setup || "";
+  document.getElementById("myGrid").value = qso.myGrid || "";
+  document.getElementById("theirGrid").value = qso.theirGrid || "";
+  document.getElementById("rstS").value = qso.rstS || "";
+  document.getElementById("rstR").value = qso.rstR || "";
+  document.getElementById("notes").value = qso.notes || "";
+  saveBtn.textContent = "Update QSO";
+  cancelBtn.classList.remove("hidden");
+}
