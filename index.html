@@ -31,23 +31,23 @@ SPDX-License-Identifier: GPL-3.0-only
 
   <section class="card">
     <h2>Import / Export</h2>
-    <div class="sub">Times are stored in local time; ADIF export uses UTC.</div>
+    <div class="sub">Times are stored in local time.</div>
 
     <div class="row">
         <button id="exportCsvBtn" type="button">Export CSV</button>
-        <button id="exportAdifBtn" type="button">Export ADIF</button>
     </div>
 
     <div class="row">
         <label>
-        Import file (CSV or ADIF)
-        <input id="importFile" type="file" accept=".csv,.adi,.adif,text/csv,text/plain" />
+        Import CSV file
+        <input id="importFile" type="file" accept=".csv,text/csv" />
         </label>
     </div>
+    <div class="sub">Expected header: callsign, dt, band, freq, mode, setup, myGrid, theirGrid, rstS, rstR, notes, id, ts</div>
 
     <details class="details">
-      <summary>Paste CSV/ADIF</summary>
-      <textarea id="importText" rows="5" placeholder="Paste CSV or ADIF here"></textarea>
+      <summary>Paste CSV</summary>
+      <textarea id="importText" rows="5" placeholder="Paste CSV here"></textarea>
       <button id="importTextBtn" type="button" class="ghost">Import Pasted</button>
     </details>
 
