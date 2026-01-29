@@ -12,6 +12,6 @@ zip -r pocket-qso.xdc manifest.toml index.html main.js style.css
 
 - `webxdc.js` is provided by Delta Chat and must not be included in the `.xdc` archive.
 
-
 ## License
-This project is licensed under the GNU GPL v3.
+
+GPL-3.0-only. See `LICENSE`.
