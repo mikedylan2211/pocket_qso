@@ -21,6 +21,14 @@ const LOCAL_KEY = "hamlog.qsos.v1";
 let editingId = null;
 let pendingDeleteId = null;
 let pendingDeleteTimer = null;
+const DEFAULT_SEND_UPDATE_INTERVAL = 10000;
+const MAX_UPDATE_INFO_BYTES = 128;
+let sendUpdateChain = Promise.resolve();
+let lastSendUpdateAt = 0;
+const AUTO_DT_REFRESH_MS = 30000;
+let dtAutoRefreshTimer = null;
+let dtManualOverride = false;
+let lastAutoDtValue = "";
 
 function isWebxdc() {
   return typeof window.webxdc !== "undefined";
@@ -30,11 +38,76 @@ function canSendUpdate() {
   return !!window.webxdc?.sendUpdate;
 }
 
+function getSendUpdateIntervalMs() {
+  const configured = Number(window.webxdc?.sendUpdateInterval);
+  if (Number.isFinite(configured) && configured >= 0) return configured;
+  return DEFAULT_SEND_UPDATE_INTERVAL;
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function truncateUtf8(str, maxBytes) {
+  if (!str || maxBytes <= 0) return "";
+  const source = String(str);
+
+  if (typeof TextEncoder !== "undefined") {
+    const encoder = new TextEncoder();
+    if (encoder.encode(source).length <= maxBytes) return source;
+
+    let out = "";
+    let bytes = 0;
+    for (const ch of source) {
+      const chBytes = encoder.encode(ch).length;
+      if (bytes + chBytes > maxBytes) break;
+      out += ch;
+      bytes += chBytes;
+    }
+    return out;
+  }
+
+  let out = "";
+  let bytes = 0;
+  for (const ch of source) {
+    const cp = ch.codePointAt(0);
+    const chBytes = cp <= 0x7F ? 1 : (cp <= 0x7FF ? 2 : (cp <= 0xFFFF ? 3 : 4));
+    if (bytes + chBytes > maxBytes) break;
+    out += ch;
+    bytes += chBytes;
+  }
+  return out;
+}
+
+function sanitizeUpdateInfo(info) {
+  if (info == null) return "";
+  const normalized = String(info).replace(/[\r\n]+/g, " ").trim();
+  return truncateUtf8(normalized, MAX_UPDATE_INFO_BYTES);
+}
+
+function queueSendUpdate(update) {
+  sendUpdateChain = sendUpdateChain
+    .then(async () => {
+      const waitMs = Math.max(0, (lastSendUpdateAt + getSendUpdateIntervalMs()) - Date.now());
+      if (waitMs > 0) await delay(waitMs);
+      return window.webxdc.sendUpdate(update, "");
+    })
+    .catch(() => {
+      // Keep queue alive if a send fails.
+    })
+    .then(() => {
+      lastSendUpdateAt = Date.now();
+    });
+
+  return sendUpdateChain;
+}
+
 function sendUpdateCompat(payload, info) {
   const update = { payload };
-  if (info) update.info = info;
+  const safeInfo = sanitizeUpdateInfo(info);
+  if (safeInfo) update.info = safeInfo;
   // Spec: second argument is deprecated; pass empty string for compatibility.
-  if (window.webxdc?.sendUpdate) return window.webxdc.sendUpdate(update, "");
+  if (window.webxdc?.sendUpdate) return queueSendUpdate(update);
 }
 
 function escapeHtml(s) {
@@ -80,6 +153,36 @@ function tsFromDT(dt) {
 
 function formatDisplayDT(dt) {
   return dt ? dt.replace("T", " ") : "";
+}
+
+function getDtElement() {
+  return document.getElementById("dt");
+}
+
+function setDtNow() {
+  const dtEl = getDtElement();
+  if (!dtEl) return "";
+  const nowValue = toLocalInputValue(new Date());
+  dtEl.value = nowValue;
+  lastAutoDtValue = nowValue;
+  return nowValue;
+}
+
+function refreshDtIfAuto() {
+  if (editingId || dtManualOverride) return;
+  const dtEl = getDtElement();
+  if (!dtEl) return;
+  const nowValue = toLocalInputValue(new Date());
+  if (dtEl.value !== nowValue) {
+    dtEl.value = nowValue;
+    lastAutoDtValue = nowValue;
+  }
+}
+
+function handleDtInput() {
+  const dtEl = getDtElement();
+  if (!dtEl || editingId) return;
+  dtManualOverride = dtEl.value !== lastAutoDtValue;
 }
 
 function formatMHzValue(mhz) {
@@ -437,8 +540,10 @@ function setStatus(msg) {
 
 function init() {
   // Default datetime = now (local time)
-  const dt = document.getElementById("dt");
-  dt.value = toLocalInputValue(new Date());
+  const dt = getDtElement();
+  setDtNow();
+  dt.addEventListener("input", handleDtInput);
+  dtAutoRefreshTimer = setInterval(refreshDtIfAuto, AUTO_DT_REFRESH_MS);
 
   document.getElementById("qsoForm").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -582,17 +687,21 @@ function setEditing(qso) {
   const cancelBtn = document.getElementById("cancelEdit");
   if (!qso) {
     editingId = null;
+    dtManualOverride = false;
     pendingDeleteId = null;
     if (pendingDeleteTimer) clearTimeout(pendingDeleteTimer);
     form.reset();
-    document.getElementById("dt").value = toLocalInputValue(new Date());
+    setDtNow();
     saveBtn.textContent = "Save QSO";
     cancelBtn.classList.add("hidden");
     return;
   }
   editingId = qso.id;
+  dtManualOverride = true;
   document.getElementById("callsign").value = qso.callsign || "";
-  document.getElementById("dt").value = qso.dt || toLocalInputValue(new Date());
+  const dtValue = qso.dt || toLocalInputValue(new Date());
+  document.getElementById("dt").value = dtValue;
+  lastAutoDtValue = dtValue;
   document.getElementById("band").value = qso.band || "";
   document.getElementById("freq").value = qso.freq || "";
   document.getElementById("mode").value = qso.mode || "";
