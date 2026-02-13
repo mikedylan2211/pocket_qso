@@ -270,7 +270,7 @@ function loadLocalQsos() {
 
 function applyUpdate(update) {
   const p = update?.payload;
-  if (!p?.type) return;
+  if (!p?.type) return false;
   let changed = false;
 
   if (p.type === "add_qso" && p.qso) {
@@ -295,6 +295,7 @@ function applyUpdate(update) {
   if (changed) {
     sortQsos();
   }
+  return changed;
 }
 
 function render() {
@@ -337,39 +338,39 @@ function render() {
 }
 
 function addQso(qso, descriptionOverride) {
-  if (!canSendUpdate()) {
-    if (insertQso(qso)) {
-      sortQsos();
-      saveLocalQsos();
-    }
-    render();
-    return;
+  const added = insertQso(qso);
+  if (added) {
+    sortQsos();
+    saveLocalQsos();
   }
+  render();
 
-  sendUpdateCompat(
-    { type: "add_qso", qso },
-    descriptionOverride || `QSO ${qso.callsign} ${qso.band || ""} ${qso.mode || ""}`.trim()
-  );
+  if (added && canSendUpdate()) {
+    sendUpdateCompat(
+      { type: "add_qso", qso },
+      descriptionOverride || `QSO ${qso.callsign} ${qso.band || ""} ${qso.mode || ""}`.trim()
+    );
+  }
 }
 
 function addQsosBatch(qsoList, descriptionOverride) {
   if (!qsoList.length) return;
-  if (!canSendUpdate()) {
-    let changed = false;
-    for (const qso of qsoList) {
-      if (insertQso(qso)) changed = true;
-    }
-    if (changed) {
-      sortQsos();
-      saveLocalQsos();
-      render();
-    }
-    return;
+  const insertedQsos = [];
+  for (const qso of qsoList) {
+    if (insertQso(qso)) insertedQsos.push(qso);
   }
+  const changed = insertedQsos.length > 0;
+  if (changed) {
+    sortQsos();
+    saveLocalQsos();
+  }
+  render();
+  if (!changed || !canSendUpdate()) return;
+
   const maxSize = window.webxdc?.sendUpdateMaxSize || 128000;
   const chunks = [];
   let current = [];
-  for (const qso of qsoList) {
+  for (const qso of insertedQsos) {
     current.push(qso);
     const size = JSON.stringify({ payload: { type: "bulk_add", qsos: current } }).length;
     if (size > maxSize && current.length > 1) {
@@ -389,34 +390,34 @@ function addQsosBatch(qsoList, descriptionOverride) {
 }
 
 function editQso(qso, descriptionOverride) {
-  if (!canSendUpdate()) {
-    if (upsertQso(qso)) {
-      sortQsos();
-      saveLocalQsos();
-      render();
-    }
-    return;
+  const changed = upsertQso(qso);
+  if (changed) {
+    sortQsos();
+    saveLocalQsos();
   }
-  sendUpdateCompat(
-    { type: "edit_qso", qso },
-    descriptionOverride || `Edited QSO ${qso.callsign}`
-  );
+  render();
+  if (changed && canSendUpdate()) {
+    sendUpdateCompat(
+      { type: "edit_qso", qso },
+      descriptionOverride || `Edited QSO ${qso.callsign}`
+    );
+  }
 }
 
 function deleteQso(id, descriptionOverride) {
   if (!id) return;
-  if (!canSendUpdate()) {
-    if (removeQsoById(id)) {
-      sortQsos();
-      saveLocalQsos();
-      render();
-    }
-    return;
+  const changed = removeQsoById(id);
+  if (changed) {
+    sortQsos();
+    saveLocalQsos();
   }
-  sendUpdateCompat(
-    { type: "delete_qso", id },
-    descriptionOverride || "Deleted QSO"
-  );
+  render();
+  if (changed && canSendUpdate()) {
+    sendUpdateCompat(
+      { type: "delete_qso", id },
+      descriptionOverride || "Deleted QSO"
+    );
+  }
 }
 
 function downloadText(filename, text, mime = "text/plain") {
@@ -665,15 +666,15 @@ function init() {
     }
   });
 
+  loadLocalQsos();
   if (window.webxdc?.setUpdateListener) {
     window.webxdc.setUpdateListener((update) => {
       if (update.serial && seenSerials.has(update.serial)) return;
       if (update.serial) seenSerials.add(update.serial);
-      applyUpdate(update);
+      const changed = applyUpdate(update);
+      if (changed) saveLocalQsos();
       render();
     }, 0);
-  } else {
-    loadLocalQsos();
   }
 
   render();
