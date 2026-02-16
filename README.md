@@ -1,7 +1,6 @@
 # Pocket QSO
 
 Minimal ham radio QSO log for Delta Chat (webxdc). Add contacts, edit/delete entries, and import/export CSV.
-Works offline. When getting back online log syncs automatically with chat.
 
 ## Build
 

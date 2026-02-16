@@ -478,9 +478,17 @@ function qsoKey(qso) {
   return `${qso.callsign}|${qso.dt}|${qso.band || ""}|${qso.freq || ""}|${qso.mode || ""}|${qso.myGrid || ""}|${qso.theirGrid || ""}`.toUpperCase();
 }
 
-function hasDuplicate(qso) {
+function hasConflictingQso(qso, excludeIndex = -1) {
   const key = qsoKey(qso);
-  return qsos.some(x => x.id === qso.id || (key && qsoKey(x) === key));
+  return qsos.some((x, idx) => {
+    if (idx === excludeIndex) return false;
+    if (x.id === qso.id) return true;
+    return !!key && qsoKey(x) === key;
+  });
+}
+
+function hasDuplicate(qso) {
+  return hasConflictingQso(qso);
 }
 
 function insertQso(qso) {
@@ -513,6 +521,7 @@ function upsertQso(qso) {
   if (!qso) return false;
   const idx = qsos.findIndex(x => x.id === qso.id);
   if (idx >= 0) {
+    if (hasConflictingQso(qso, idx)) return false;
     if (qsoEquals(qsos[idx], qso)) return false;
     qsos[idx] = qso;
     return true;
