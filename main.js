@@ -19,11 +19,14 @@ let qsos = [];
 let seenSerials = new Set();
 const LOCAL_KEY = "hamlog.qsos.v1";
 const OUTBOX_KEY = "hamlog.outbox.v1";
+const LAST_APPLIED_SERIAL_KEY = "hamlog.last_serial.v1";
 let editingId = null;
 let pendingDeleteId = null;
 let pendingDeleteTimer = null;
 const DEFAULT_SEND_UPDATE_INTERVAL = 10000;
+const DEFAULT_SEND_UPDATE_MAX_SIZE = 128000;
 const OUTBOX_FLUSH_INTERVAL_MS = 12000;
+const OUTBOX_RETRY_MIN_DELAY_MS = 250;
 const MAX_UPDATE_INFO_BYTES = 128;
 let lastSendUpdateAt = 0;
 const AUTO_DT_REFRESH_MS = 30000;
@@ -31,6 +34,8 @@ let dtManualOverride = false;
 let lastAutoDtValue = "";
 let outbox = [];
 let outboxFlushInProgress = false;
+let outboxRetryTimer = null;
+let lastAppliedSerial = 0;
 
 function canSendUpdate() {
   return !!window.webxdc?.sendUpdate;
@@ -40,6 +45,12 @@ function getSendUpdateIntervalMs() {
   const configured = Number(window.webxdc?.sendUpdateInterval);
   if (Number.isFinite(configured) && configured >= 0) return configured;
   return DEFAULT_SEND_UPDATE_INTERVAL;
+}
+
+function getSendUpdateMaxSize() {
+  const configured = Number(window.webxdc?.sendUpdateMaxSize);
+  if (Number.isFinite(configured) && configured > 0) return configured;
+  return DEFAULT_SEND_UPDATE_MAX_SIZE;
 }
 
 function truncateUtf8(str, maxBytes) {
@@ -71,6 +82,26 @@ function truncateUtf8(str, maxBytes) {
     bytes += chBytes;
   }
   return out;
+}
+
+function utf8ByteLength(str) {
+  if (str == null) return 0;
+  const source = String(str);
+
+  if (typeof TextEncoder !== "undefined") {
+    return new TextEncoder().encode(source).length;
+  }
+
+  let bytes = 0;
+  for (const ch of source) {
+    const cp = ch.codePointAt(0);
+    bytes += cp <= 0x7F ? 1 : (cp <= 0x7FF ? 2 : (cp <= 0xFFFF ? 3 : 4));
+  }
+  return bytes;
+}
+
+function updateSizeBytes(update) {
+  return utf8ByteLength(JSON.stringify(update));
 }
 
 function sanitizeUpdateInfo(info) {
@@ -129,6 +160,26 @@ function writeStoredArray(key, value, label) {
     return true;
   } catch (_) {
     setStorageWarning(`Storage warning: could not save ${label}.`);
+    return false;
+  }
+}
+
+function readStoredNumber(key, fallback = 0) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw == null) return fallback;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function writeStoredNumber(key, value) {
+  try {
+    localStorage.setItem(key, String(value));
+    return true;
+  } catch (_) {
     return false;
   }
 }
@@ -206,6 +257,17 @@ function loadOutbox() {
   outbox = normalizeOutboxUpdates(readStoredArray(OUTBOX_KEY, "pending updates"));
 }
 
+function loadLastAppliedSerial() {
+  const saved = readStoredNumber(LAST_APPLIED_SERIAL_KEY, 0);
+  lastAppliedSerial = Number.isFinite(saved) && saved > 0 ? Math.floor(saved) : 0;
+}
+
+function saveLastAppliedSerial(serial) {
+  if (!Number.isFinite(serial) || serial <= lastAppliedSerial) return;
+  lastAppliedSerial = Math.floor(serial);
+  writeStoredNumber(LAST_APPLIED_SERIAL_KEY, lastAppliedSerial);
+}
+
 function enqueueUpdate(payload, info) {
   const normalizedPayload = normalizeUpdatePayload(payload);
   if (!normalizedPayload) return false;
@@ -225,13 +287,34 @@ async function sendWebxdcUpdate(update) {
   }
 }
 
+function clearOutboxRetryTimer() {
+  if (!outboxRetryTimer) return;
+  clearTimeout(outboxRetryTimer);
+  outboxRetryTimer = null;
+}
+
+function scheduleOutboxRetry(waitMs) {
+  if (!Number.isFinite(waitMs) || waitMs <= 0) {
+    clearOutboxRetryTimer();
+    return;
+  }
+  const delay = Math.max(OUTBOX_RETRY_MIN_DELAY_MS, Math.ceil(waitMs));
+  clearOutboxRetryTimer();
+  outboxRetryTimer = setTimeout(() => {
+    outboxRetryTimer = null;
+    flushOutbox();
+  }, delay);
+}
+
 async function flushOutbox() {
   updatePendingStatus();
   if (!canSendUpdate()) {
+    clearOutboxRetryTimer();
     setSyncStatus("local mode");
     return;
   }
   if (!outbox.length) {
+    clearOutboxRetryTimer();
     setSyncStatus("up to date");
     return;
   }
@@ -240,10 +323,29 @@ async function flushOutbox() {
   const waitMs = Math.max(0, (lastSendUpdateAt + getSendUpdateIntervalMs()) - Date.now());
   if (waitMs > 0) {
     setSyncStatus("waiting interval");
+    scheduleOutboxRetry(waitMs);
+    return;
+  }
+  clearOutboxRetryTimer();
+
+  const nextUpdate = outbox[0];
+  const maxUpdateSize = getSendUpdateMaxSize();
+  const nextUpdateSize = updateSizeBytes(nextUpdate);
+  if (nextUpdateSize > maxUpdateSize) {
+    outbox.shift();
+    saveOutbox();
+    updatePendingStatus();
+    setSyncStatus("oversized update skipped");
+    setStatus(`Skipped one oversized sync update (${nextUpdateSize}/${maxUpdateSize} bytes).`);
+    console.warn("Skipped oversized update", {
+      size: nextUpdateSize,
+      max: maxUpdateSize,
+      payloadType: nextUpdate?.payload?.type || "unknown"
+    });
+    if (outbox.length) flushOutbox();
     return;
   }
 
-  const nextUpdate = outbox[0];
   outboxFlushInProgress = true;
   setSyncStatus("sending");
   try {
@@ -253,6 +355,8 @@ async function flushOutbox() {
     lastSendUpdateAt = Date.now();
     setSyncStatus(outbox.length ? "pending" : "up to date");
   } catch (_) {
+    // Back off according to sendUpdateInterval to avoid tight retry loops.
+    lastSendUpdateAt = Date.now();
     setSyncStatus("retrying");
   } finally {
     outboxFlushInProgress = false;
@@ -363,6 +467,10 @@ function formatFreqDisplay(freq) {
   const mhz = parseFreqMHz(freq);
   if (mhz == null) return freq.toString().trim();
   return `${formatMHzValue(mhz)} MHz`;
+}
+
+function makeId(ts) {
+  return globalThis.crypto?.randomUUID?.() ?? `${ts}-${Math.random()}`;
 }
 
 function qsoKey(qso) {
@@ -532,16 +640,30 @@ function addQsosBatch(qsoList, descriptionOverride) {
   render();
   if (!changed) return 0;
 
-  const maxSize = window.webxdc?.sendUpdateMaxSize || 128000;
+  const maxSize = getSendUpdateMaxSize();
   const chunks = [];
+  const singleUpdates = [];
   let current = [];
   for (const qso of insertedQsos) {
-    current.push(qso);
-    const size = JSON.stringify({ payload: { type: "bulk_add", qsos: current } }).length;
-    if (size > maxSize && current.length > 1) {
-      current.pop();
+    const candidate = current.concat(qso);
+    const candidateInfo = descriptionOverride || `Imported ${candidate.length} QSO(s)`;
+    const candidateUpdate = makeUpdate({ type: "bulk_add", qsos: candidate }, candidateInfo);
+    if (updateSizeBytes(candidateUpdate) <= maxSize) {
+      current = candidate;
+      continue;
+    }
+
+    if (current.length) {
       chunks.push(current);
+      current = [];
+    }
+
+    const singleInfo = descriptionOverride || "Imported 1 QSO";
+    const singleBulkUpdate = makeUpdate({ type: "bulk_add", qsos: [qso] }, singleInfo);
+    if (updateSizeBytes(singleBulkUpdate) <= maxSize) {
       current = [qso];
+    } else {
+      singleUpdates.push(qso);
     }
   }
   if (current.length) chunks.push(current);
@@ -550,6 +672,13 @@ function addQsosBatch(qsoList, descriptionOverride) {
     enqueueUpdate(
       { type: "bulk_add", qsos: chunk },
       descriptionOverride || `Imported ${chunk.length} QSO(s)`
+    );
+  }
+
+  for (const qso of singleUpdates) {
+    enqueueUpdate(
+      { type: "add_qso", qso },
+      descriptionOverride || `Imported ${qso.callsign || "QSO"}`
     );
   }
   return insertedQsos.length;
@@ -612,7 +741,6 @@ function sendFileToChat(filename, text, mime, label) {
   return true;
 }
 
-// ---------- CSV ----------
 function csvEscape(value) {
   const s = (value ?? "").toString();
   if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
@@ -632,7 +760,6 @@ function exportCsv() {
   setStatus("Exported CSV.");
 }
 
-// Basic CSV parser (handles quoted fields)
 function parseCsv(text) {
   const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").filter(l => l.trim().length);
   if (!lines.length) return [];
@@ -680,7 +807,7 @@ function importCsv(text) {
     const parsedTs = tsFromDT(dt);
     const ts = Number(r.ts) || parsedTs || Date.now();
     const qso = {
-      id: (r.id && r.id.trim()) ? r.id.trim() : (crypto.randomUUID?.() ?? `${ts}-${Math.random()}`),
+      id: (r.id && r.id.trim()) ? r.id.trim() : makeId(ts),
       callsign,
       dt,
       band: (r.band || "").trim(),
@@ -701,7 +828,6 @@ function importCsv(text) {
   return inserted;
 }
 
-// ---------- UI wiring ----------
 function setStatus(msg) {
   const el = document.getElementById("importStatus");
   if (el) el.textContent = msg || "";
@@ -732,7 +858,7 @@ function init() {
 
     const ts = tsFromLocalDT(dtLocal) || Date.now();
     const qso = {
-      id: editingId || (crypto.randomUUID?.() ?? `${ts}-${Math.random()}`),
+      id: editingId || makeId(ts),
       callsign,
       dt: dtLocal,
       band,
@@ -836,18 +962,23 @@ function init() {
 
   loadLocalQsos();
   loadOutbox();
+  loadLastAppliedSerial();
   updatePendingStatus();
   setSyncStatus("checking");
 
   if (window.webxdc?.setUpdateListener) {
     try {
+      const startSerial = Number.isFinite(lastAppliedSerial) && lastAppliedSerial > 0 ? lastAppliedSerial : 0;
       const ready = window.webxdc.setUpdateListener((update) => {
-        if (update.serial && seenSerials.has(update.serial)) return;
-        if (update.serial) seenSerials.add(update.serial);
+        const serial = Number(update?.serial);
+        if (Number.isFinite(serial) && serial <= lastAppliedSerial) return;
+        if (Number.isFinite(serial) && seenSerials.has(serial)) return;
+        if (Number.isFinite(serial) && serial > 0) seenSerials.add(serial);
         const changed = applyUpdate(update);
         if (changed) saveLocalQsos();
+        if (Number.isFinite(serial) && serial > 0) saveLastAppliedSerial(serial);
         render();
-      }, 0);
+      }, startSerial);
       if (ready && typeof ready.catch === "function") {
         ready.catch(() => setSyncStatus("listener failed"));
       }
