@@ -18,21 +18,19 @@ SPDX-License-Identifier: GPL-3.0-only
 let qsos = [];
 let seenSerials = new Set();
 const LOCAL_KEY = "hamlog.qsos.v1";
+const OUTBOX_KEY = "hamlog.outbox.v1";
 let editingId = null;
 let pendingDeleteId = null;
 let pendingDeleteTimer = null;
 const DEFAULT_SEND_UPDATE_INTERVAL = 10000;
+const OUTBOX_FLUSH_INTERVAL_MS = 12000;
 const MAX_UPDATE_INFO_BYTES = 128;
-let sendUpdateChain = Promise.resolve();
 let lastSendUpdateAt = 0;
 const AUTO_DT_REFRESH_MS = 30000;
-let dtAutoRefreshTimer = null;
 let dtManualOverride = false;
 let lastAutoDtValue = "";
-
-function isWebxdc() {
-  return typeof window.webxdc !== "undefined";
-}
+let outbox = [];
+let outboxFlushInProgress = false;
 
 function canSendUpdate() {
   return !!window.webxdc?.sendUpdate;
@@ -42,10 +40,6 @@ function getSendUpdateIntervalMs() {
   const configured = Number(window.webxdc?.sendUpdateInterval);
   if (Number.isFinite(configured) && configured >= 0) return configured;
   return DEFAULT_SEND_UPDATE_INTERVAL;
-}
-
-function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function truncateUtf8(str, maxBytes) {
@@ -85,29 +79,187 @@ function sanitizeUpdateInfo(info) {
   return truncateUtf8(normalized, MAX_UPDATE_INFO_BYTES);
 }
 
-function queueSendUpdate(update) {
-  sendUpdateChain = sendUpdateChain
-    .then(async () => {
-      const waitMs = Math.max(0, (lastSendUpdateAt + getSendUpdateIntervalMs()) - Date.now());
-      if (waitMs > 0) await delay(waitMs);
-      return window.webxdc.sendUpdate(update, "");
-    })
-    .catch(() => {
-      // Keep queue alive if a send fails.
-    })
-    .then(() => {
-      lastSendUpdateAt = Date.now();
-    });
-
-  return sendUpdateChain;
-}
-
-function sendUpdateCompat(payload, info) {
+function makeUpdate(payload, info) {
   const update = { payload };
   const safeInfo = sanitizeUpdateInfo(info);
   if (safeInfo) update.info = safeInfo;
+  return update;
+}
+
+function setSyncStatus(text) {
+  const el = document.getElementById("syncStatus");
+  if (el) el.textContent = `Sync: ${text || "checking"}`;
+}
+
+function updatePendingStatus() {
+  const el = document.getElementById("pendingStatus");
+  if (el) el.textContent = `Pending updates: ${outbox.length}`;
+}
+
+function setStorageWarning(message) {
+  const el = document.getElementById("storageStatus");
+  if (!el) return;
+  if (!message) {
+    el.textContent = "";
+    el.classList.add("hidden");
+    return;
+  }
+  el.textContent = message;
+  el.classList.remove("hidden");
+}
+
+function readStoredArray(key, label) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed;
+    setStorageWarning(`Storage warning: ${label} was not valid and was reset.`);
+    return [];
+  } catch (_) {
+    setStorageWarning(`Storage warning: could not read ${label}.`);
+    return [];
+  }
+}
+
+function writeStoredArray(key, value, label) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+    setStorageWarning("");
+    return true;
+  } catch (_) {
+    setStorageWarning(`Storage warning: could not save ${label}.`);
+    return false;
+  }
+}
+
+function isPlainObject(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function toText(value) {
+  return value == null ? "" : String(value);
+}
+
+function normalizeQso(raw) {
+  if (!isPlainObject(raw)) return null;
+  const id = toText(raw.id).trim();
+  const callsign = toText(raw.callsign).trim().toUpperCase();
+  const dt = toText(raw.dt).trim();
+  if (!id || !callsign || !dt) return null;
+
+  const parsedTs = Number(raw.ts);
+  const ts = Number.isFinite(parsedTs) ? parsedTs : (tsFromDT(dt) || Date.now());
+  return {
+    id,
+    callsign,
+    dt,
+    band: toText(raw.band).trim(),
+    freq: toText(raw.freq).trim(),
+    mode: toText(raw.mode).trim().toUpperCase(),
+    setup: toText(raw.setup).trim(),
+    myGrid: toText(raw.myGrid).trim().toUpperCase(),
+    theirGrid: toText(raw.theirGrid).trim().toUpperCase(),
+    rstS: toText(raw.rstS).trim(),
+    rstR: toText(raw.rstR).trim(),
+    notes: toText(raw.notes).trim(),
+    ts
+  };
+}
+
+function normalizeUpdatePayload(payload) {
+  if (!isPlainObject(payload)) return null;
+  const type = toText(payload.type).trim();
+  if (type === "add_qso" || type === "edit_qso") {
+    const qso = normalizeQso(payload.qso);
+    return qso ? { type, qso } : null;
+  }
+  if (type === "bulk_add") {
+    if (!Array.isArray(payload.qsos)) return null;
+    const qsos = payload.qsos.map(normalizeQso).filter(Boolean);
+    return qsos.length ? { type, qsos } : null;
+  }
+  if (type === "delete_qso") {
+    const id = toText(payload.id).trim();
+    return id ? { type, id } : null;
+  }
+  return null;
+}
+
+function normalizeOutboxUpdates(items) {
+  if (!Array.isArray(items)) return [];
+  const normalized = [];
+  for (const item of items) {
+    if (!isPlainObject(item)) continue;
+    const payload = normalizeUpdatePayload(item.payload);
+    if (!payload) continue;
+    normalized.push(makeUpdate(payload, item.info));
+  }
+  return normalized;
+}
+
+function saveOutbox() {
+  return writeStoredArray(OUTBOX_KEY, outbox, "pending updates");
+}
+
+function loadOutbox() {
+  outbox = normalizeOutboxUpdates(readStoredArray(OUTBOX_KEY, "pending updates"));
+}
+
+function enqueueUpdate(payload, info) {
+  const normalizedPayload = normalizeUpdatePayload(payload);
+  if (!normalizedPayload) return false;
+  outbox.push(makeUpdate(normalizedPayload, info));
+  saveOutbox();
+  updatePendingStatus();
+  flushOutbox();
+  return true;
+}
+
+async function sendWebxdcUpdate(update) {
+  if (!window.webxdc?.sendUpdate) throw new Error("sendUpdate unavailable");
   // Spec: second argument is deprecated; pass empty string for compatibility.
-  if (window.webxdc?.sendUpdate) return queueSendUpdate(update);
+  const maybePromise = window.webxdc.sendUpdate(update, "");
+  if (maybePromise && typeof maybePromise.then === "function") {
+    await maybePromise;
+  }
+}
+
+async function flushOutbox() {
+  updatePendingStatus();
+  if (!canSendUpdate()) {
+    setSyncStatus("local mode");
+    return;
+  }
+  if (!outbox.length) {
+    setSyncStatus("up to date");
+    return;
+  }
+  if (outboxFlushInProgress) return;
+
+  const waitMs = Math.max(0, (lastSendUpdateAt + getSendUpdateIntervalMs()) - Date.now());
+  if (waitMs > 0) {
+    setSyncStatus("waiting interval");
+    return;
+  }
+
+  const nextUpdate = outbox[0];
+  outboxFlushInProgress = true;
+  setSyncStatus("sending");
+  try {
+    await sendWebxdcUpdate(nextUpdate);
+    outbox.shift();
+    saveOutbox();
+    lastSendUpdateAt = Date.now();
+    setSyncStatus(outbox.length ? "pending" : "up to date");
+  } catch (_) {
+    setSyncStatus("retrying");
+  } finally {
+    outboxFlushInProgress = false;
+    updatePendingStatus();
+  }
+
+  if (outbox.length) flushOutbox();
 }
 
 function escapeHtml(s) {
@@ -230,10 +382,30 @@ function insertQso(qso) {
   return true;
 }
 
+function qsoEquals(a, b) {
+  if (!a || !b) return false;
+  return (
+    a.id === b.id &&
+    a.callsign === b.callsign &&
+    a.dt === b.dt &&
+    (a.band || "") === (b.band || "") &&
+    (a.freq || "") === (b.freq || "") &&
+    (a.mode || "") === (b.mode || "") &&
+    (a.setup || "") === (b.setup || "") &&
+    (a.myGrid || "") === (b.myGrid || "") &&
+    (a.theirGrid || "") === (b.theirGrid || "") &&
+    (a.rstS || "") === (b.rstS || "") &&
+    (a.rstR || "") === (b.rstR || "") &&
+    (a.notes || "") === (b.notes || "") &&
+    Number(a.ts || 0) === Number(b.ts || 0)
+  );
+}
+
 function upsertQso(qso) {
   if (!qso) return false;
   const idx = qsos.findIndex(x => x.id === qso.id);
   if (idx >= 0) {
+    if (qsoEquals(qsos[idx], qso)) return false;
     qsos[idx] = qso;
     return true;
   }
@@ -251,26 +423,18 @@ function sortQsos() {
 }
 
 function saveLocalQsos() {
-  try {
-    localStorage.setItem(LOCAL_KEY, JSON.stringify(qsos));
-  } catch (_) {}
+  return writeStoredArray(LOCAL_KEY, qsos, "QSO log");
 }
 
 function loadLocalQsos() {
-  try {
-    const raw = localStorage.getItem(LOCAL_KEY);
-    if (!raw) return;
-    const data = JSON.parse(raw);
-    if (Array.isArray(data)) {
-      qsos = data.filter(Boolean);
-      sortQsos();
-    }
-  } catch (_) {}
+  const data = readStoredArray(LOCAL_KEY, "QSO log");
+  qsos = data.map(normalizeQso).filter(Boolean);
+  sortQsos();
 }
 
 function applyUpdate(update) {
-  const p = update?.payload;
-  if (!p?.type) return false;
+  const p = normalizeUpdatePayload(update?.payload);
+  if (!p) return false;
   let changed = false;
 
   if (p.type === "add_qso" && p.qso) {
@@ -345,16 +509,17 @@ function addQso(qso, descriptionOverride) {
   }
   render();
 
-  if (added && canSendUpdate()) {
-    sendUpdateCompat(
+  if (added) {
+    enqueueUpdate(
       { type: "add_qso", qso },
       descriptionOverride || `QSO ${qso.callsign} ${qso.band || ""} ${qso.mode || ""}`.trim()
     );
   }
+  return added;
 }
 
 function addQsosBatch(qsoList, descriptionOverride) {
-  if (!qsoList.length) return;
+  if (!qsoList.length) return 0;
   const insertedQsos = [];
   for (const qso of qsoList) {
     if (insertQso(qso)) insertedQsos.push(qso);
@@ -365,7 +530,7 @@ function addQsosBatch(qsoList, descriptionOverride) {
     saveLocalQsos();
   }
   render();
-  if (!changed || !canSendUpdate()) return;
+  if (!changed) return 0;
 
   const maxSize = window.webxdc?.sendUpdateMaxSize || 128000;
   const chunks = [];
@@ -382,11 +547,12 @@ function addQsosBatch(qsoList, descriptionOverride) {
   if (current.length) chunks.push(current);
 
   for (const chunk of chunks) {
-    sendUpdateCompat(
+    enqueueUpdate(
       { type: "bulk_add", qsos: chunk },
       descriptionOverride || `Imported ${chunk.length} QSO(s)`
     );
   }
+  return insertedQsos.length;
 }
 
 function editQso(qso, descriptionOverride) {
@@ -396,12 +562,13 @@ function editQso(qso, descriptionOverride) {
     saveLocalQsos();
   }
   render();
-  if (changed && canSendUpdate()) {
-    sendUpdateCompat(
+  if (changed) {
+    enqueueUpdate(
       { type: "edit_qso", qso },
       descriptionOverride || `Edited QSO ${qso.callsign}`
     );
   }
+  return changed;
 }
 
 function deleteQso(id, descriptionOverride) {
@@ -412,12 +579,13 @@ function deleteQso(id, descriptionOverride) {
     saveLocalQsos();
   }
   render();
-  if (changed && canSendUpdate()) {
-    sendUpdateCompat(
+  if (changed) {
+    enqueueUpdate(
       { type: "delete_qso", id },
       descriptionOverride || "Deleted QSO"
     );
   }
+  return changed;
 }
 
 function downloadText(filename, text, mime = "text/plain") {
@@ -489,7 +657,7 @@ function parseCsv(text) {
     return out;
   };
 
-  const header = parseLine(lines[0]).map(h => h.trim());
+  const header = parseLine(lines[0]).map((h, idx) => (idx === 0 ? h.replace(/^\uFEFF/, "") : h).trim());
   const records = [];
   for (let i=1; i<lines.length; i++) {
     const cols = parseLine(lines[i]);
@@ -529,8 +697,8 @@ function importCsv(text) {
     qsoList.push(qso);
   }
 
-  addQsosBatch(qsoList, `Imported ${qsoList.length} QSO(s)`);
-  return qsoList.length;
+  const inserted = addQsosBatch(qsoList);
+  return inserted;
 }
 
 // ---------- UI wiring ----------
@@ -544,7 +712,7 @@ function init() {
   const dt = getDtElement();
   setDtNow();
   dt.addEventListener("input", handleDtInput);
-  dtAutoRefreshTimer = setInterval(refreshDtIfAuto, AUTO_DT_REFRESH_MS);
+  setInterval(refreshDtIfAuto, AUTO_DT_REFRESH_MS);
 
   document.getElementById("qsoForm").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -667,16 +835,34 @@ function init() {
   });
 
   loadLocalQsos();
+  loadOutbox();
+  updatePendingStatus();
+  setSyncStatus("checking");
+
   if (window.webxdc?.setUpdateListener) {
-    window.webxdc.setUpdateListener((update) => {
-      if (update.serial && seenSerials.has(update.serial)) return;
-      if (update.serial) seenSerials.add(update.serial);
-      const changed = applyUpdate(update);
-      if (changed) saveLocalQsos();
-      render();
-    }, 0);
+    try {
+      const ready = window.webxdc.setUpdateListener((update) => {
+        if (update.serial && seenSerials.has(update.serial)) return;
+        if (update.serial) seenSerials.add(update.serial);
+        const changed = applyUpdate(update);
+        if (changed) saveLocalQsos();
+        render();
+      }, 0);
+      if (ready && typeof ready.catch === "function") {
+        ready.catch(() => setSyncStatus("listener failed"));
+      }
+    } catch (_) {
+      setSyncStatus("listener failed");
+    }
+  } else {
+    setSyncStatus("local mode");
   }
 
+  setInterval(flushOutbox, OUTBOX_FLUSH_INTERVAL_MS);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") flushOutbox();
+  });
+  flushOutbox();
   render();
 }
 
