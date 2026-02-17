@@ -15,28 +15,276 @@ You should have received a copy of the GNU General Public License
 along with this program. If not, see <https://www.gnu.org/licenses/>.
 SPDX-License-Identifier: GPL-3.0-only
 */
-body { font-family: system-ui, sans-serif; margin: 0; padding: 12px; background: #0f1115; color: #e6e7ea; }
-header { margin-bottom: 12px; }
-h1 { margin: 0; font-size: 20px; }
-.sub { color: #a0a6b1; font-size: 12px; margin-top: 2px; }
-.sub.warn { color: #ffb9b9; }
-.card { background: #171a21; padding: 12px; border-radius: 10px; margin-bottom: 12px; border: 1px solid #232834; }
-.row { display: flex; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
-.row.space { justify-content: space-between; align-items: center; }
-label { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 160px; }
-input { padding: 8px; border: 1px solid #2a303c; border-radius: 8px; background: #0f1115; color: #e6e7ea; }
-textarea { padding: 8px; border: 1px solid #2a303c; border-radius: 8px; width: 100%; resize: vertical; background: #0f1115; color: #e6e7ea; }
-button { padding: 10px 12px; border: 0; border-radius: 10px; background: #4c8dff; color: #0b0d12; font-weight: 700; }
-.ghost { background: #242a36; color: #d5d9e2; }
-.danger { background: #3b1a1a; color: #ff8a8a; }
-.hidden { display: none; }
-#importTextBtn { margin-top: 8px; }
-.details { margin-top: 8px; }
-#list { display: grid; gap: 8px; }
-.item { border: 1px solid #232834; border-radius: 10px; padding: 10px; background: #141821; }
-.item b { font-size: 14px; }
-.meta { color: #9aa3b3; font-size: 12px; margin-top: 2px; }
-.notes { margin-top: 6px; font-size: 13px; }
-.empty { color: #9aa3b3; font-size: 13px; padding: 8px; }
-.actions { display: flex; gap: 6px; margin-top: 6px; }
-.actions button { padding: 6px 8px; font-size: 12px; }
+:root {
+  --bg-main: #020403;
+  --bg-section: #060a08;
+  --bg-code: #000;
+
+  --text-main: #d4fbe6;
+  --text-muted: #7fa59a;
+
+  --green: #00ff88;
+  --cyan: #5cc8ff;
+  --amber: #ffcb6b;
+  --red: #ff5370;
+  --purple: #c792ea;
+
+  --border: #1f5e49;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 1rem;
+  background-color: var(--bg-main);
+  color: var(--text-main);
+  font-family:
+    ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    Monaco,
+    Consolas,
+    "Liberation Mono",
+    "Courier New",
+    monospace;
+  font-size: 0.95rem;
+  line-height: 1.65;
+}
+
+/* CRT scanlines */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(255, 255, 255, 0.015),
+    rgba(255, 255, 255, 0.015) 1px,
+    transparent 1px,
+    transparent 2px
+  );
+  opacity: 0.05;
+}
+
+header {
+  margin: 0 auto 1rem;
+  max-width: 980px;
+}
+
+h1,
+h2 {
+  color: var(--green);
+  font-weight: 600;
+  margin: 0;
+}
+
+h1 {
+  font-size: 1.9rem;
+  line-height: 1.2;
+}
+
+h2 {
+  font-size: 1.15rem;
+  margin-bottom: 0.9rem;
+  padding-bottom: 0.55rem;
+  border-bottom: 2px dashed var(--border);
+}
+
+h2::before {
+  content: "## ";
+}
+
+.sub {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  margin-top: 0.25rem;
+}
+
+.sub.warn {
+  color: var(--red);
+}
+
+.card {
+  max-width: 980px;
+  margin: 0 auto 1rem;
+  padding: 1.1rem 1.15rem;
+  background-color: var(--bg-section);
+  border: 3px solid var(--border);
+  box-shadow:
+    inset 0 0 0 1px rgba(0, 255, 136, 0.06),
+    inset 0 0 0 3px rgba(0, 0, 0, 0.6);
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+  margin-bottom: 0.75rem;
+}
+
+.row.space {
+  justify-content: space-between;
+  align-items: center;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  flex: 1;
+  min-width: 160px;
+}
+
+#qsoForm > label {
+  margin-bottom: 0.75rem;
+}
+
+input,
+textarea {
+  width: 100%;
+  padding: 0.55rem 0.6rem;
+  border: 2px solid var(--border);
+  border-radius: 0;
+  background: var(--bg-main);
+  color: var(--text-main);
+  font: inherit;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-muted);
+}
+
+input:focus,
+textarea:focus,
+button:focus,
+summary:focus {
+  outline: 2px dashed var(--amber);
+  outline-offset: 1px;
+}
+
+button {
+  padding: 0.55rem 0.75rem;
+  border: 2px solid var(--green);
+  border-radius: 0;
+  background: transparent;
+  color: var(--green);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: var(--cyan);
+  color: var(--cyan);
+}
+
+.ghost {
+  border-color: var(--amber);
+  color: var(--amber);
+}
+
+.ghost:hover {
+  border-color: var(--purple);
+  color: var(--purple);
+}
+
+.danger {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.danger:hover {
+  border-color: var(--purple);
+  color: var(--purple);
+}
+
+.hidden {
+  display: none;
+}
+
+.details {
+  margin-top: 0.75rem;
+}
+
+summary {
+  color: var(--cyan);
+  cursor: pointer;
+}
+
+#importTextBtn {
+  margin-top: 0.6rem;
+}
+
+#search {
+  max-width: 360px;
+}
+
+#list {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.item {
+  padding: 0.8rem;
+  border: 2px solid var(--border);
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.item b {
+  color: var(--green);
+}
+
+.meta {
+  margin-top: 0.15rem;
+  color: var(--amber);
+  font-size: 0.86rem;
+}
+
+.notes {
+  margin-top: 0.45rem;
+  color: var(--text-main);
+}
+
+.empty {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+
+.actions {
+  display: flex;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+
+.actions button {
+  padding: 0.35rem 0.5rem;
+  font-size: 0.8rem;
+}
+
+@media (max-width: 700px) {
+  body {
+    padding: 0.7rem;
+    font-size: 0.9rem;
+  }
+
+  h1 {
+    font-size: 1.4rem;
+  }
+
+  .card {
+    padding: 0.9rem;
+  }
+
+  .row.space {
+    align-items: stretch;
+  }
+
+  #search {
+    max-width: none;
+  }
+}
